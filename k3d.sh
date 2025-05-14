@@ -1,4 +1,41 @@
 #!/usr/bin/env bash
+# 功能说明:
+#
+# 本脚本旨在自动化创建一个支持 IPv4/IPv6 双栈的 k3d Kubernetes 集群，
+# 并配置宿主机的 Nginx 作为反向代理，将外部访问（特别是 IPv6 访问）
+# 路由到 k3d 集群内的服务。
+#
+# 主要特性:
+# 1. 创建双栈 Docker 网络: 为 k3d 集群提供 IPv4 和 IPv6 连接。
+# 2. 配置 NAT66: 允许集群内的 IPv6 Pod 访问外部 IPv6 网络。
+# 3. 创建 k3d 集群:
+#    - 禁用默认的 Traefik Ingress 控制器。
+#    - 配置双栈的 Pod CIDR 和 Service CIDR。
+# 4. 配置 Nginx 反向代理:
+#    - 监听宿主机的 443 端口 (TCP/SNI 透传) 和 80 端口 (HTTP)。
+#    - 根据域名将请求转发到 k3d 集群的负载均衡器。
+# 5. 动态管理 kubectl 配置: 自动获取并使用临时 kubeconfig 文件与集群交互。
+#
+# 依赖项:
+# - docker: 用于运行 k3d 集群。
+# - k3d: 用于创建和管理 Kubernetes 集群。
+# - nginx: 作为反向代理服务器。
+# - ip6tables: 用于配置 NAT66。
+# - sysctl: 用于调整内核参数 (如 IPv6 转发)。
+# - kubectl: 用于与 Kubernetes 集群交互。
+# - (可选) netfilter-persistent: 用于持久化 ip6tables 规则。
+#
+# 使用方法:
+#   ./k3d.sh <cluster_name>
+#   例如: ./k3d.sh mycluster
+#
+# 注意事项:
+# - 脚本中的部分命令需要 sudo 权限执行 (例如操作 Docker 网络、ip6tables、
+#   Nginx 配置、k3d 集群创建/删除等)。脚本会按需调用 sudo。
+# - 脚本会推导域名为 <cluster_name>.unifra.xyz，请确保此域名解析正确或
+#   根据需要修改 DOMAIN 变量。
+# - 脚本会创建临时的 kubeconfig 文件用于 kubectl 操作，并在退出时自动清理。
+
 # k3d‑ipv6‑bootstrap.sh — 自动化创建 dual‑stack k3d 集群 + 宿主机 Nginx 反向代理（IPv6 Only 外网）
 # 依赖：docker, k3d, nginx, ip6tables, (可选) netfilter-persistent
 #

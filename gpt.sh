@@ -1,10 +1,4 @@
 #!/usr/bin/env bash
-# k3d‑ipv6-bootstrap.sh — 自动化创建 / 删除 dual‑stack k3d 集群 + 宿主机 Nginx 反向代理（IPv6 Only 外网）
-# 依赖：docker, k3d, nginx, ip6tables, sudo, (可选) netfilter-persistent, nc
-#
-# 用法示例：
-#   ./k3d-ipv6-bootstrap.sh dogeos          # 创建集群 dogeos → *.dogeos.unifra.xyz
-#   ./k3d-ipv6-bootstrap.sh dogeos --delete # 删除并清理
 
 set -eu -o pipefail
 
@@ -17,8 +11,8 @@ command -v sudo >/dev/null || {
 # —— 可按需修改的全局常量 ——
 ############################
 readonly DOCKER_BRIDGE_NAME="k3d-ipv6-net"
-LOCAL_80=8000
-LOCAL_443=44300
+#随机选择2个可用端口
+
 readonly SUBNET_PREFIX="fd00:beaf" # 私有 IPv6 前缀
 readonly DOCKER_IPV4_SUBNET="172.28.0.0/16"
 readonly DOCKER_IPV6_SUBNET="${SUBNET_PREFIX}::/64"
@@ -27,6 +21,7 @@ readonly DOCKER_IPV6_GATEWAY="${SUBNET_PREFIX}::1"
 
 # NAT66 匹配范围 — /48 同时涵盖节点容器 /64 与 Pod /56
 readonly NAT66_SRC_RANGE="${SUBNET_PREFIX}::/48"
+read LOCAL_80 LOCAL_443 < <(get_two_free_ports)
 
 ############################
 # —— 日志工具 ——
@@ -86,6 +81,27 @@ check_host_sanity() {
     fi
 }
 
+get_two_free_ports() {
+    local start_port=20000
+    local end_port=60000
+    local found_ports=()
+
+    for ((port = start_port; port <= end_port; port++)); do
+        # 检查 TCP 端口是否已被监听（支持 IPv4 和 IPv6）
+        if ! ss -lnt | awk '{print $4}' | grep -qE "[:.]$port\$"; then
+            found_ports+=("$port")
+        fi
+
+        if [ "${#found_ports[@]}" -ge 2 ]; then
+            echo "${found_ports[0]} ${found_ports[1]}"
+            return 0
+        fi
+    done
+
+    echo "Error: Could not find 2 free ports in range $start_port-$end_port" >&2
+    return 1
+}
+
 ############################
 # —— 核心函数 ——
 ############################
@@ -94,17 +110,6 @@ enable_ipv6_forwarding() {
     sudo sysctl -qw net.ipv6.conf.all.forwarding=1
     sudo grep -q '^net.ipv6.conf.all.forwarding=1' /etc/sysctl.conf ||
         echo 'net.ipv6.conf.all.forwarding=1' | sudo tee -a /etc/sysctl.conf >/dev/null
-}
-
-create_docker_network() {
-    if ! docker network inspect "$DOCKER_BRIDGE_NAME" >/dev/null 2>&1; then
-        log "创建 Docker dual‑stack 网络 $DOCKER_BRIDGE_NAME..."
-        docker network create "$DOCKER_BRIDGE_NAME" --driver bridge \
-            --subnet "$DOCKER_IPV4_SUBNET" --gateway "$DOCKER_IPV4_GATEWAY" \
-            --ipv6 --subnet "$DOCKER_IPV6_SUBNET" --gateway "$DOCKER_IPV6_GATEWAY"
-    else
-        log "Docker 网络 $DOCKER_BRIDGE_NAME 已存在"
-    fi
 }
 
 setup_nat66() {
@@ -145,7 +150,7 @@ map \$host \$backend_http {
 }
 
 server {
-    listen 80 reuseport;
+    listen [::]:80 reuseport;
     location / {
         proxy_pass http://\$backend_http;
         proxy_set_header Host \$host;
@@ -153,6 +158,9 @@ server {
 }
 EOF
 
+    log "添加 Nginx 配置"
+    log "cat /etc/nginx/conf.d/k3d-http-${CLUSTER}.conf"
+    cat /etc/nginx/conf.d/k3d-http-${CLUSTER}.conf
     # 写 STREAM 片段
     sudo tee /etc/nginx/stream-conf.d/k3d-stream-${CLUSTER}.conf >/dev/null <<EOF
 stream {
@@ -169,11 +177,23 @@ stream {
 }
 EOF
 
+    log "cat /etc/nginx/stream-conf.d/k3d-stream-${CLUSTER}.conf"
+    cat /etc/nginx/stream-conf.d/k3d-stream-${CLUSTER}.conf
     reload_nginx
 }
 
 reload_nginx() {
     sudo nginx -t && { sudo systemctl reload nginx 2>/dev/null || sudo nginx -s reload; }
+}
+create_docker_network() {
+    if ! docker network inspect "$DOCKER_BRIDGE_NAME" >/dev/null 2>&1; then
+        log "创建 Docker dual‑stack 网络 $DOCKER_BRIDGE_NAME..."
+        docker network create "$DOCKER_BRIDGE_NAME" --driver bridge \
+            --subnet "$DOCKER_IPV4_SUBNET" --gateway "$DOCKER_IPV4_GATEWAY" \
+            --ipv6 --subnet "$DOCKER_IPV6_SUBNET" --gateway "$DOCKER_IPV6_GATEWAY"
+    else
+        log "Docker 网络 $DOCKER_BRIDGE_NAME 已存在"
+    fi
 }
 
 ############################
@@ -197,6 +217,7 @@ if k3d cluster list | awk 'NR>1 {print $1}' | grep -qx "$CLUSTER"; then
     log "集群 $CLUSTER 已存在，删除"
     k3d cluster delete $CLUSTER
 fi
+
 create_k3d_cluster
 add_nginx_blocks
 
