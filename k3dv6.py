@@ -8,6 +8,7 @@ import socket
 import subprocess
 import sys
 import time
+import tempfile
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict
 
@@ -32,7 +33,7 @@ class Config:
 
     # k3d集群相关配置
     DEFAULT_DOMAIN_SUFFIX = "unifra.xyz"
-    DEFAULT_AGENT_COUNT = 1
+    DEFAULT_AGENT_COUNT = 2
 
     # Nginx 相关配置
     NGINX_HTTP_CONF_DIR = "/etc/nginx/conf.d"
@@ -88,42 +89,56 @@ def run_cmd(cmd: List[str], check: bool = True, capture_output: bool = True, sud
 
 # 找到两个可用端口
 def get_two_free_ports() -> Tuple[int, int]:
-    start_port = 20000
-    end_port = 60000
-    found_ports = []
-    
     # 获取已使用端口列表
     try:
         result = run_cmd(["ss", "-lnt"])
         used_ports = set()
         for line in result.stdout.splitlines()[1:]:  # 跳过标题行
             parts = line.split()
-            if len(parts) >= 5:
-                addr = parts[3]
-                port_match = re.search(r':(\d+)$', addr)
+            if len(parts) >= 5: # ss output can vary, ensure we have enough parts
+                addr = parts[3] # For 'ss -lnt', Local Address:Port is typically the 4th field (0-indexed)
+                port_match = re.search(r':(\\d+)$', addr)
                 if port_match:
                     used_ports.add(int(port_match.group(1)))
     except Exception as e:
         warn(f"获取已使用端口时出错: {e}")
         used_ports = set()
     
-    # 找两个未使用的端口
-    for port in range(start_port, end_port + 1):
-        if port not in used_ports:
-            # 双重检查端口是否可用
+    # 尝试 xx 从 0 到 99
+    for xx in range(100): # Generates xx from 0 to 99
+        http_port = 8000 + xx
+        https_port = 44300 + xx
+
+        if http_port in used_ports:
+            info(f"端口 {http_port} (80{xx:02d}) 在 ss 输出中被标记为已使用，跳过 xx={xx:02d}")
+            continue
+        if https_port in used_ports:
+            info(f"端口 {https_port} (443{xx:02d}) 在 ss 输出中被标记为已使用，跳过 xx={xx:02d}")
+            continue
+
+        # 双重检查端口是否可用
+        http_port_free = False
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s_http:
+                s_http.bind(("127.0.0.1", http_port))
+            http_port_free = True
+        except OSError:
+            info(f"端口 {http_port} (80{xx:02d}) 绑定测试失败，尝试下一个 xx={xx:02d}")
+            continue # http_port 不可用，尝试下一个 xx
+
+        if http_port_free:
             try:
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                    s.bind(("127.0.0.1", port))
-                found_ports.append(port)
-                if len(found_ports) >= 2:
-                    break
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s_https:
+                    s_https.bind(("127.0.0.1", https_port))
+                # 两个端口都可用
+                log(f"找到可用端口对: HTTP={http_port} (80{xx:02d}), HTTPS={https_port} (443{xx:02d})")
+                return http_port, https_port
             except OSError:
+                info(f"端口 {https_port} (443{xx:02d}) 绑定测试失败 (HTTP端口 {http_port} 可用)，尝试下一个 xx={xx:02d}")
+                # https_port 不可用，继续下一个 xx
                 continue
     
-    if len(found_ports) < 2:
-        die(f"无法在 {start_port}-{end_port} 范围内找到 2 个可用端口")
-    
-    return found_ports[0], found_ports[1]
+    die("无法在 8000-8099 和 44300-44399 范围内找到符合模式 80xx, 443xx 的可用端口对")
 
 # 等待容器可用
 def wait_for_container(container: str, timeout: int = 60) -> bool:
@@ -350,7 +365,7 @@ def configure_nginx_for_cluster(cluster_name: str, domain_suffix: str, http_port
 # 更新 Nginx 配置文件（添加或更新集群配置）
 def update_nginx_config_with_patterns(config_file: str, cluster_name: str, domain_suffix: str, port: int, is_http: bool) -> None:
     """添加或更新 Nginx 配置中的集群配置，并处理可能的端口冲突"""
-    domain_pattern = f"~^.*\\.{cluster_name}\\.{domain_suffix}$"
+    domain_pattern = fr"~^(?:.*\.)?{cluster_name}\.{domain_suffix}$"
     indent = "    " if is_http else "        "
     backend_line = f"{indent}{domain_pattern}  127.0.0.1:{port};"
     port_pattern = f"127.0.0.1:{port}"
@@ -462,7 +477,7 @@ def remove_nginx_config_for_cluster(cluster_name: str, domain_suffix: str = None
     if domain_suffix is None:
         domain_suffix = Config.DEFAULT_DOMAIN_SUFFIX
     
-    domain_pattern = f"~^.*\\.{cluster_name}\\.{domain_suffix}$"
+    domain_pattern = fr"~^(?:.*\.)?{cluster_name}\.{domain_suffix}$"
     log(f"从 Nginx 配置中删除集群 {cluster_name} 的映射")
     
     # 处理 HTTP 配置
@@ -532,34 +547,66 @@ def reload_nginx() -> bool:
         return False
 
 # 在 k3d 节点上配置网络
-def configure_k3d_node_networking(cluster_name: str, agent_count: int) -> None:
-    log("配置 k3d 节点网络...")
+def configure_k3d_node_networking(cluster_name: str) -> None:
+    log("配置 k3d 节点网络 (动态发现 agent 节点)... ")
     
-    # 计算Pod子网CIDR
-    pod_cidr = f"{Config.SUBNET_PREFIX}:42::/56"
+    pod_cidr = f"{Config.SUBNET_PREFIX}:42::/56" # Pod CIDR
     
-    # 配置服务器节点
-    server_container = f"k3d-{cluster_name}-server-0"
-    if wait_for_container(server_container, 30):
-        info(f"配置服务器节点 NAT: {server_container}")
+    # 1. 配置服务器节点 (通常只有一个，且命名固定)
+    server_container_name = f"k3d-{cluster_name}-server-0"
+    if wait_for_container(server_container_name, 30):
+        info(f"配置服务器节点 NAT: {server_container_name}")
         run_cmd([
-            "docker", "exec", server_container, "ip6tables", "-t", "nat", "-A", "POSTROUTING",
+            "docker", "exec", server_container_name, "ip6tables", "-t", "nat", "-A", "POSTROUTING",
             "-s", pod_cidr, "-o", "eth0", "-j", "MASQUERADE"
         ])
     else:
-        warn(f"容器 {server_container} 未就绪，可能影响网络配置")
-    
-    # 配置代理节点
-    for i in range(agent_count):
-        agent_container = f"k3d-{cluster_name}-agent-{i}"
-        if wait_for_container(agent_container, 30):
-            info(f"配置代理节点 NAT: {agent_container}")
-            run_cmd([
-                "docker", "exec", agent_container, "ip6tables", "-t", "nat", "-A", "POSTROUTING",
-                "-s", pod_cidr, "-o", "eth0", "-j", "MASQUERADE"
-            ])
-        else:
-            warn(f"容器 {agent_container} 未就绪，跳过网络配置")
+        warn(f"服务器容器 {server_container_name} 未就绪，可能影响网络配置。")
+
+    # 2. 动态发现并配置 Agent 节点
+    log(f"动态发现集群 '{cluster_name}' 的 agent 节点...")
+    try:
+        # 使用 docker ps 筛选属于特定集群且角色为 agent 的容器
+        # k3d 通常会给容器打上标签，如 k3d.cluster=<cluster_name> 和 k3d.role=agent
+        # 我们也检查容器名中是否包含 agent 作为备用方案
+        cmd = [
+            "docker", "ps",
+            "--filter", f"label=k3d.cluster={cluster_name}",
+            "--filter", "label=k3d.role=agent",
+            "--format", "{{.Names}}"
+        ]
+        result = run_cmd(cmd, check=True, capture_output=True, sudo=False)
+        agent_container_names = [name.strip() for name in result.stdout.splitlines() if name.strip()] 
+
+        if not agent_container_names:
+            # 如果基于标签的筛选没有结果，尝试基于名称的模糊匹配 (作为备选方案)
+            info(f"未通过标签找到 agent 节点，尝试基于名称匹配 k3d-{cluster_name}-agent-* ...")
+            cmd_fallback = [
+                "docker", "ps",
+                "--filter", f"name=k3d-{cluster_name}-agent",
+                "--format", "{{.Names}}"
+            ]
+            result_fallback = run_cmd(cmd_fallback, check=True, capture_output=True, sudo=False)
+            agent_container_names = [name.strip() for name in result_fallback.stdout.splitlines() if name.strip()]
+
+        if not agent_container_names:
+            warn(f"未能动态发现集群 '{cluster_name}' 的 agent 节点。将跳过 agent 节点的 NAT 配置。")
+            return
+
+        log(f"找到以下 Agent 节点: {', '.join(agent_container_names)}")
+
+        for agent_container_name in agent_container_names:
+            if wait_for_container(agent_container_name, 30): # 确保容器实际存在且可操作
+                info(f"配置 Agent 节点 NAT: {agent_container_name}")
+                run_cmd([
+                    "docker", "exec", agent_container_name, "ip6tables", "-t", "nat", "-A", "POSTROUTING",
+                    "-s", pod_cidr, "-o", "eth0", "-j", "MASQUERADE"
+                ])
+            else:
+                warn(f"Agent 容器 {agent_container_name} 未就绪或未找到，跳过其 NAT 配置。")
+                
+    except Exception as e:
+        warn(f"动态发现或配置 agent 节点时出错: {e}。请检查 Docker 是否正在运行以及是否有权限执行 docker ps。")
 
 # 删除集群及相关资源
 def delete_cluster_resources(cluster_name: str, domain_suffix: str) -> None:
@@ -599,12 +646,16 @@ def main() -> None:
                         help=f"设置域名后缀 (默认: {Config.DEFAULT_DOMAIN_SUFFIX})")
     parser.add_argument("--agents", type=int, default=Config.DEFAULT_AGENT_COUNT,
                        help=f"设置 agent 节点数量 (默认: {Config.DEFAULT_AGENT_COUNT})")
+    parser.add_argument("--install-suite", action="store_true", 
+                        help="安装一套标准的 Kubernetes 组件 (如 nginx, cert-manager, external-secrets, vault) 到新创建的集群中。")
+    parser.add_argument("--if-exists", choices=["skip", "recreate"], default="skip",
+                        help="当同名集群已存在时的操作：'skip' (跳过创建及k3d网络/Nginx配置)，'recreate' (删除并重新创建，默认)")
     
     args = parser.parse_args()
     
     # 设置详细日志级别
     Config.VERBOSE = args.verbose
-    
+    warn("warn 提示")
     # 检查权限
     if os.geteuid() != 0 and not check_sudo_available():
         die("此脚本需要 sudo 权限执行网络配置操作")
@@ -624,31 +675,61 @@ def main() -> None:
         delete_cluster_resources(args.cluster_name, args.domain_suffix)
         return
     
-    # 获取可用端口
+    # 检查集群是否存在
+    cluster_exists_check_result = run_cmd(["k3d", "cluster", "list"], check=False)
+    cluster_is_present = False
+    if cluster_exists_check_result.returncode == 0:
+        cluster_pattern = re.compile(rf"^{re.escape(args.cluster_name)}\s")
+        if any(cluster_pattern.match(line) for line in cluster_exists_check_result.stdout.splitlines()[1:]):
+            cluster_is_present = True
+
+    if cluster_is_present:
+        log(f"集群 '{args.cluster_name}' 已存在。")
+        if args.if_exists == "recreate":
+            log("操作设置为 'recreate'：将删除并重新创建集群。")
+            run_cmd(["k3d", "cluster", "delete", args.cluster_name])
+            # 让流程继续到下面的创建部分
+        elif args.if_exists == "skip":
+            log("操作设置为 'skip'：将跳过集群创建、k3d 网络配置和主机 Nginx 配置。")
+            if args.install_suite:
+                log(f"将尝试在现有集群 '{args.cluster_name}' 上安装套件。")
+                log(f"重要提示：请确保 kubectl 上下文已正确设置为目标集群 '{args.cluster_name}'。")
+                try:
+                    install_cluster_suite()
+                except Exception as e:
+                    error(f"为现有集群 '{args.cluster_name}' 安装套件时出错: {e}")
+                    warn("套件安装可能未完成。")
+            log(f"✅ 操作完成：集群 '{args.cluster_name}' 已存在并跳过创建。")
+            return # 结束脚本执行
+    # 如果集群不存在，或者存在但设置为 recreate (已被删除)，则继续创建流程
+
+    log(f"准备为集群 '{args.cluster_name}' 进行创建或重新创建操作。")
+    
+    # 获取可用端口 (仅在创建/重新创建时需要)
     try:
         http_port, https_port = get_two_free_ports()
-        info(f"使用端口: HTTP={http_port}, HTTPS={https_port}")
+        info(f"为新集群/重新创建的集群选定端口: HTTP={http_port}, HTTPS={https_port}")
     except Exception as e:
         die(f"无法获取可用端口: {e}")
-    
-    # 如果同名集群已存在，先删除
-    result = run_cmd(["k3d", "cluster", "list"], check=False)
-    if result.returncode == 0:
-        cluster_pattern = re.compile(rf"^{re.escape(args.cluster_name)}\s")
-        for line in result.stdout.splitlines()[1:]:  # 跳过标题行
-            if cluster_pattern.match(line):
-                log(f"集群 {args.cluster_name} 已存在，先删除")
-                run_cmd(["k3d", "cluster", "delete", args.cluster_name])
-                break
     
     # 创建新集群并配置
     create_k3d_cluster(args.cluster_name, args.agents, http_port, https_port)
     configure_nginx_for_cluster(args.cluster_name, args.domain_suffix, http_port, https_port)
-    configure_k3d_node_networking(args.cluster_name, args.agents)
+    configure_k3d_node_networking(args.cluster_name)
     
-    log(f"✅ 完成：集群 {args.cluster_name} 就绪，*.{domain} → k3d ingress")
-    info(f"  - HTTP 端口: {http_port}")
-    info(f"  - HTTPS 端口: {https_port}")
+    # 如果指定，安装集群套件
+    if args.install_suite:
+        log(f"为新创建/重新创建的集群 '{args.cluster_name}' 安装套件。")
+        try:
+            install_cluster_suite() # k3d create 通常会设置 kubectl 上下文
+        except Exception as e:
+            error(f"为新集群 '{args.cluster_name}' 安装套件时出错: {e}")
+            warn("套件安装可能未完成。")
+
+    log(f"✅ 完成：集群 '{args.cluster_name}' 已成功创建/重新创建并配置。")
+    info(f"  - HTTP 端口 (宿主机): {http_port}")
+    info(f"  - HTTPS 端口 (宿主机): {https_port}")
+    info(f"  - 应用域名(例如 *.{{domain}})应指向 k3d ingress (通常是 127.0.0.1 或者宿主机的 IP)。")
 
 # 检查 sudo 是否可用
 def check_sudo_available() -> bool:
@@ -657,6 +738,196 @@ def check_sudo_available() -> bool:
         return result.returncode == 0
     except Exception:
         return False
+
+# Helper to apply Kubernetes YAML content from a string
+def _apply_kube_yaml_from_string(yaml_content: str, description: str) -> None:
+    try:
+        # Create a temporary file to store the YAML content
+        # The tempfile module is used for secure creation of temporary files
+        with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".yaml") as tmp_yaml:
+            tmp_yaml.write(yaml_content)
+            tmp_yaml_path = tmp_yaml.name
+       
+        log(f"正在应用 Kubernetes YAML: {description}")
+        # run_cmd is used to execute kubectl. sudo=False as kubectl typically doesn't require it.
+        # check=True will raise an exception if kubectl apply fails.
+        run_cmd(["kubectl", "apply", "-f", tmp_yaml_path], sudo=False, check=True)
+        info(f"成功应用 YAML: {description}")
+       
+    except Exception as e:
+        # Log the error. Depending on requirements, this might need to be more critical (e.g., sys.exit)
+        error(f"应用 YAML 时出错 ({description}): {e}")
+    finally:
+        # Ensure the temporary file is deleted after use
+        if 'tmp_yaml_path' in locals() and os.path.exists(tmp_yaml_path):
+            os.remove(tmp_yaml_path)
+
+# Helper to wait for a pod to be ready based on label selector and namespace
+def _wait_for_pod_ready(namespace: str, label_selector: str, pod_name_hint: str, timeout: int = 300, check_interval: int = 10) -> bool:
+    log(f"等待命名空间 '{namespace}' 中标签为 '{label_selector}' 的 {pod_name_hint} Pod 就绪...")
+    start_time = time.time()
+    # This JSONPath query attempts to mimic the behavior of the original shell script.
+    # It checks the 'ready' status of the first container of the first pod found.
+    jsonpath_query = '{.items[0].status.containerStatuses[0].ready}'
+   
+    while time.time() - start_time < timeout:
+        cmd = [
+            "kubectl", "get", "pods",
+            "-n", namespace,
+            "-l", label_selector,
+            "-o", f"jsonpath={jsonpath_query}"
+        ]
+        # Execute kubectl command. check=False because the pod/path might not exist initially, leading to non-zero exit codes.
+        # capture_output=True to get stdout/stderr for checking readiness.
+        result = run_cmd(cmd, check=False, capture_output=True, sudo=False)
+       
+        # Check if command was successful and stdout is 'true'
+        if result.returncode == 0 and result.stdout.strip() == "true":
+            log(f"{pod_name_hint} Pod 已就绪。")
+            return True
+        else:
+            # Log current status for debugging if verbose logging is on or if there's an error
+            info(f"仍在等待 {pod_name_hint} Pod... 状态: stdout='{result.stdout.strip()}', stderr='{result.stderr.strip()}', code={result.returncode}")
+            time.sleep(check_interval)
+           
+    warn(f"等待 {pod_name_hint} Pod 超时 ({timeout} 秒)。")
+    return False
+
+# Helper to wait for a CustomResourceDefinition (CRD) to be established
+def _wait_for_crd_ready(crd_name: str, timeout: int = 120, check_interval: int = 5) -> bool:
+    log(f"等待 CRD '{crd_name}' 建立...")
+    start_time = time.time()
+    # JSONPath query to check the 'Established' condition status of the CRD
+    # A CRD is established when its Established condition is True
+    jsonpath_query = '{.status.conditions[?(@.type=="Established")].status}'
+
+    while time.time() - start_time < timeout:
+        cmd = [
+            "kubectl", "get", "crd", crd_name,
+            "-o", f"jsonpath={jsonpath_query}"
+        ]
+        result = run_cmd(cmd, check=False, capture_output=True, sudo=False)
+
+        if result.returncode == 0 and result.stdout.strip().lower() == "true":
+            log(f"CRD '{crd_name}' 已建立。")
+            return True
+        else:
+            info(f"仍在等待 CRD '{crd_name}' 建立... 状态: stdout='{result.stdout.strip()}', stderr='{result.stderr.strip()}', code={result.returncode}")
+            time.sleep(check_interval)
+    
+    warn(f"等待 CRD '{crd_name}' 建立超时 ({timeout} 秒)。")
+    return False
+
+def install_cluster_suite() -> None:
+    log("开始安装集群套件 (nginx-ingress, cert-manager, external-secrets, vault)...")
+
+    # 1. Nginx-ingress installation
+    log("阶段 1: 安装 nginx-ingress")
+    run_cmd(["helm", "repo", "add", "nginx-stable", "https://kubernetes.github.io/ingress-nginx"], sudo=False, check=True)
+    run_cmd(["helm", "repo", "update"], sudo=False, check=True)
+    run_cmd(["helm", "upgrade", "--install", "nginx-ingress", "nginx-stable/ingress-nginx", 
+             "--namespace", "kube-system", 
+             "--set", "controller.config.ssl-redirect=false",
+             "--wait"], sudo=False, check=True)
+    log("已使用 --wait 标志启动 nginx-ingress Helm chart 安装。")
+    # Fallback or more specific check if needed, Helm --wait can sometimes be insufficient for deep checks.
+    if not _wait_for_pod_ready("kube-system", "app.kubernetes.io/name=ingress-nginx", "nginx-ingress-controller"):
+        warn("Nginx Ingress 控制器未能通过自定义检查报告就绪。Helm 的 --wait 可能已先生效。谨慎操作。")
+
+    # 2. Cert-manager installation
+    log("阶段 2: 安装 cert-manager")
+    cert_manager_yaml_url = "https://github.com/cert-manager/cert-manager/releases/download/v1.16.0/cert-manager.yaml"
+    # Ensure cert-manager namespace exists if not created by the YAML, though standard YAMLs usually do.
+    # run_cmd(["kubectl", "create", "namespace", "cert-manager"], check=False, sudo=False) # If needed
+    run_cmd(["kubectl", "apply", "-f", cert_manager_yaml_url], sudo=False, check=True)
+    log("已发出 cert-manager YAML 应用命令。")
+    if not _wait_for_pod_ready("cert-manager", "app.kubernetes.io/instance=cert-manager", "cert-manager controller/webhook"): # Common labels for cert-manager v1.16
+         warn("Cert-manager 未报告就绪。谨慎操作。")
+
+    log("显示 kube-system 命名空间中的服务 (信息性)")
+    run_cmd(["kubectl", "get", "services", "-n", "kube-system"], sudo=False, capture_output=False, check=False) 
+
+    # 3. External-secrets installation
+    log("阶段 3: 安装 external-secrets")
+    run_cmd(["helm", "repo", "add", "external-secrets", "https://charts.external-secrets.io"], sudo=False, check=True)
+    run_cmd(["helm", "repo", "update"], sudo=False, check=True)
+    run_cmd(["helm", "upgrade", "--install", "external-secrets", "external-secrets/external-secrets", 
+             "-n", "external-secrets", "--create-namespace",
+             "--wait"], sudo=False, check=True)
+    log("已使用 --wait 标志启动 external-secrets Helm chart 安装。")
+    if not _wait_for_pod_ready("external-secrets", "app.kubernetes.io/name=external-secrets", "external-secrets controller"):
+        warn("External-secrets 未能通过自定义检查报告就绪。谨慎操作。")
+
+    # Ensure SecretStore CRD is established before trying to create SecretStore resources
+    if not _wait_for_crd_ready("secretstores.external-secrets.io"):
+        die("SecretStore CRD 未能及时建立，无法继续配置 Vault SecretStore。")
+
+    log("显示 external-secrets 命名空间中的服务 (信息性)")
+    run_cmd(["kubectl", "get", "services", "-n", "external-secrets"], sudo=False, capture_output=False, check=False)
+
+    # 4. HashiCorp Vault (in dev mode) installation
+    log("阶段 4: 安装 HashiCorp Vault (开发模式)")
+    run_cmd(["helm", "repo", "add", "hashicorp", "https://helm.releases.hashicorp.com"], sudo=False, check=True)
+    run_cmd(["helm", "repo", "update"], sudo=False, check=True)
+    run_cmd(["helm", "upgrade", "--install", "vault", "hashicorp/vault", 
+             "--set", "server.dev.enabled=true", 
+             "--wait"], sudo=False, check=True)
+    log("已使用 --wait 标志启动 Vault Helm chart 安装。")
+    if not _wait_for_pod_ready("default", "app.kubernetes.io/name=vault", "vault server"):
+        warn("Vault 未能通过自定义检查报告就绪。谨慎操作。")
+
+    # 5. Configure Vault SecretStore for External Secrets
+    log("阶段 5: 配置 Vault SecretStore 和令牌 Secret")
+    # Note: Ensure the SecretStore and its referenced token are in namespaces accessible by external-secrets controller
+    # And that Vault is accessible from external-secrets pods.
+    vault_secret_store_yaml = """
+apiVersion: external-secrets.io/v1
+kind: SecretStore
+metadata:
+  name: vault-backend
+spec:
+  provider:
+    vault:
+      server: "http://vault.default.svc.cluster.local:8200"
+      path: "scroll"
+      version: "v2"
+      auth:
+        tokenSecretRef:
+          name: vault-token
+          key: token
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: vault-token
+type: Opaque
+stringData:
+  token: "root"  # This is the default token in dev mode. Don't use in production!
+"""
+    _apply_kube_yaml_from_string(vault_secret_store_yaml, "Vault SecretStore 和令牌 Secret")
+
+    # 6. Configure LetsEncrypt ClusterIssuer for Cert-Manager
+    log("阶段 6: 配置 LetsEncrypt ClusterIssuer")
+    letsencrypt_issuer_yaml = """
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: shu@unifra.io # IMPORTANT: Replace with a valid email address for Let's Encrypt registration
+    privateKeySecretRef:
+      # Secret resource that will be used to store the ACME account private key
+      name: letsencrypt-prod-private-key
+    solvers:
+      - http01:
+          ingress:
+            class: nginx # Matches the ingress controller class installed earlier
+"""
+    _apply_kube_yaml_from_string(letsencrypt_issuer_yaml, "LetsEncrypt ClusterIssuer")
+
+    log("✅ 集群套件安装过程完成。")
 
 if __name__ == "__main__":
     main()
