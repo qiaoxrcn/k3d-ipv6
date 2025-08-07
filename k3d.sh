@@ -13,10 +13,9 @@
 # ==============================================================================
 
 # --- 可配置变量 (请根据您的实际情况修改) ---
-CLUSTER_NAME="shu2"
+CLUSTER_NAME="c1"
 K3D_VOLUME_DIR="$HOME/k3d-storage/${CLUSTER_NAME}"
 DOGECOIN_DATA_DIR="$K3D_VOLUME_DIR/dogecoin-data"
-CELESTIA_DATA_DIR="$K3D_VOLUME_DIR/celestia-data"
 
 LETSENCRYPT_EMAIL="shu@unifra.io"
 # --- END 可配置变量 ---
@@ -65,14 +64,13 @@ step1_create_cluster() {
         warn "集群 '$CLUSTER_NAME' 已存在，跳过创建步骤。"
     else
         info "正在创建名为 '$CLUSTER_NAME' 的 K3d 集群..."
-        mkdir -p "$DOGECOIN_DATA_DIR" "$CELESTIA_DATA_DIR"
+        mkdir -p "$DOGECOIN_DATA_DIR" 
         k3d cluster create "$CLUSTER_NAME" \
             --agents 0 \
             --port '80:80@loadbalancer' \
             --port '443:443@loadbalancer' \
             --k3s-arg "--disable=traefik@server:*" \
-            --volume "${DOGECOIN_DATA_DIR}:/data/dogecoin" \
-            --volume "${CELESTIA_DATA_DIR}:/data/celestia"
+            --volume "${DOGECOIN_DATA_DIR}:/data/dogecoin"
 
         if [ $? -eq 0 ]; then
             success "集群 '$CLUSTER_NAME' 创建成功。"
