@@ -14,8 +14,7 @@
 
 # --- 可配置变量 (请根据您的实际情况修改) ---
 CLUSTER_NAME="c1"
-K3D_VOLUME_DIR="$HOME/k3d-storage/${CLUSTER_NAME}"
-DOGECOIN_DATA_DIR="$K3D_VOLUME_DIR/dogecoin-data"
+DOGECOIN_DATA_DIR="$HOME/k3d-storage/dogecoin-data"
 
 LETSENCRYPT_EMAIL="shu@unifra.io"
 # --- END 可配置变量 ---
